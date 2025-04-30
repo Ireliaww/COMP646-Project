@@ -44,7 +44,7 @@ class TextDataset(Dataset):
     def __init__(self, csv_file, clip_model, device):
         df = pd.read_csv(csv_file)
         # Clean the text labels
-        df['clean'] = df['style_label'].apply(clean_text)
+        df['clean'] = df['style'].apply(clean_text)
         self.texts = df['clean'].tolist()
         self.clip_model = clip_model
         self.device = device
