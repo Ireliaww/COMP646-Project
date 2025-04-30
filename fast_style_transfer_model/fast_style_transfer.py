@@ -171,8 +171,8 @@ if __name__ == '__main__':
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     # Train (you’ll want more epochs in practice—e.g. 4–6)
     decoder = train_fast_style_transfer(
-        content_dir='../datasets/COCO/train2017',
-        style_dir  ='../datasets/WikiArt/wikiart/images',
+        content_dir='../Datasets/COCO/train2017',
+        style_dir  ='../Datasets/WikiArt/wikiart/images',
         batch_size = 8,
         img_size   = 256,
         epochs     = 4,

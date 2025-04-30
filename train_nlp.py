@@ -19,7 +19,7 @@ from NLP_Model.text_mapping import StyleMapping
 
 # Configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-data_csv = 'data/annotations.csv'
+data_csv = 'Datasets/WikiArt/annotations.csv'
 batch_size = 32
 epochs = 10
 learning_rate = 1e-3
