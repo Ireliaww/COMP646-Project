@@ -1,188 +1,240 @@
 import os
+import csv
+import glob
+import random
+from itertools import cycle
+
+# performance settings
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['OMP_NUM_THREADS']    = '1'
+
 import torch
+# enable cudnn autotuner for optimized kernels
+torch.backends.cudnn.benchmark = True
+# single-threaded CPU for PyTorch
+torch.set_num_threads(1)
+
+torch.backends.openmp.enabled = False
+
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+from torchvision.models import vgg19, VGG19_Weights
 from PIL import Image
 
-# -- 1) AdaIN function -----------------------------------------------
-def adaptive_instance_norm(content_feat, style_feat, eps=1e-5):
-    # channel-wise mean & std
-    c_mean = content_feat.mean([2,3], keepdim=True)
-    c_std  = content_feat.std([2,3], keepdim=True) + eps
-    s_mean = style_feat.mean([2,3], keepdim=True)
-    s_std  = style_feat.std([2,3], keepdim=True) + eps
-    return s_std * (content_feat - c_mean) / c_std + s_mean
+# -----------------------------------------------------------------------------
+# Settings
+# -----------------------------------------------------------------------------
+DEVICE         = 'cuda' if torch.cuda.is_available() else 'cpu'
+IMG_SIZE       = 256
+BATCH_SIZE     = 8
+EPOCHS         = 6
+LR             = 1e-4
+CONTENT_WEIGHT = 1.0
+STYLE_WEIGHT   = 10.0
+TV_WEIGHT      = 1e-6
 
-# -- 2) Encoder (VGG19 upto relu4_1) --------------------------------
+# Indices of VGG layers for style loss (relu1_1, 2_1, 3_1, 4_1)
+STYLE_LAYERS = [0, 5, 10, 19, 21]
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def mul255(x):
+    """Scale tensor from [0,1] to [0,255]."""
+    return x * 255
+
+class ListImageDataset(Dataset):
+    def __init__(self, paths, transform):
+        self.paths     = paths
+        self.transform = transform
+    def __len__(self):
+        return len(self.paths)
+    def __getitem__(self, idx):
+        img = Image.open(self.paths[idx]).convert('RGB')
+        return self.transform(img)
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
 class VGGEncoder(nn.Module):
+    """VGG19 up to relu4_1 for feature extraction."""
     def __init__(self):
         super().__init__()
-        vgg = models.vgg19(pretrained=True).features
-        # slice upto relu4_1 (layer 21)
-        self.enc_layers = nn.Sequential(*[vgg[x] for x in range(22)])
+        vgg = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features
+        self.enc_layers = nn.Sequential(*list(vgg)[:22])
         for p in self.enc_layers.parameters():
             p.requires_grad = False
-
     def forward(self, x):
         return self.enc_layers(x)
 
-# -- 3) Decoder (mirror of encoder) ----------------------------------
 class Decoder(nn.Module):
+    """Mirror of encoder: maps 512×H/16×W/16 back to 3×H×W."""
     def __init__(self):
         super().__init__()
-        # This mirror architecture may need tuning to match the encoder's channels.
         self.net = nn.Sequential(
-            # input: 512 x H/16 x W/16
             nn.Conv2d(512,256,3,1,1), nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest'),    # ->256 x H/8
-            nn.Conv2d(256,256,3,1,1), nn.ReLU(inplace=True),
-            nn.Conv2d(256,256,3,1,1), nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(256,256,3,1,1), nn.ReLU(inplace=True),
             nn.Conv2d(256,128,3,1,1), nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest'),    # ->128 x H/4
-            nn.Conv2d(128,128,3,1,1), nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(128,64,3,1,1),  nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest'),    # ->64 x H/2
-            nn.Conv2d(64,64,3,1,1),   nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='nearest'),    # ->64 x H
+            nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(64,3,3,1,1)
         )
-
     def forward(self, x):
         return self.net(x)
 
-# -- 4) Gram matrix --------------------------------------------------
+# -----------------------------------------------------------------------------
+# Gram matrix for style loss
+# -----------------------------------------------------------------------------
 def gram_matrix(feat):
-    (b, c, h, w) = feat.size()
-    feat = feat.view(b, c, h*w)
-    return torch.bmm(feat, feat.transpose(1,2)) / (c * h * w)
+    b, c, h, w = feat.shape
+    feat = feat.view(b, c, h * w)
+    return torch.bmm(feat, feat.transpose(1, 2)) / (c * h * w)
 
-# -- 5) Training pipeline --------------------------------------------
-def train_fast_style_transfer(
-    content_dir, style_dir,
-    batch_size=8, img_size=256,
-    epochs=2, lr=1e-4,
-    content_weight=1.0, style_weight=10.0, tv_weight=1e-6,
-    device='cuda'
-):
-    # a) Data loaders
-    tf = transforms.Compose([
-        transforms.Resize(img_size),
-        transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x * 255)
-    ])
-    content_ds = datasets.ImageFolder(content_dir, transform=tf)
-    style_ds   = datasets.ImageFolder(style_dir,   transform=tf)
-    content_loader = DataLoader(content_ds, batch_size, shuffle=True, num_workers=4)
-    style_loader   = DataLoader(style_ds,   batch_size, shuffle=True, num_workers=4)
-    style_iter = iter(style_loader)
+# -----------------------------------------------------------------------------
+# Precompute style Gram targets
+# -----------------------------------------------------------------------------
+def compute_style_targets(style_folder, transform, device):
+    style_paths = glob.glob(os.path.join(style_folder, '*.jpg'))
+    ds = ListImageDataset(style_paths, transform)
+    loader = DataLoader(ds, BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
 
-    # b) Models
+    encoder = VGGEncoder().to(device).eval()
+    gram_sums = {l: 0.0 for l in STYLE_LAYERS}
+    count = 0
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            x = batch
+            for idx, layer in enumerate(encoder.enc_layers):
+                x = layer(x)
+                if idx in STYLE_LAYERS:
+                    G = gram_matrix(x)
+                    gram_sums[idx] += G.sum(dim=0, keepdim=True)
+            count += batch.size(0)
+
+    # average
+    gram_avg = {l: (gram_sums[l] / count).to(device) for l in STYLE_LAYERS}
+    return gram_avg
+
+# -----------------------------------------------------------------------------
+# Training per-style feed-forward network
+# -----------------------------------------------------------------------------
+def train_per_style(content_paths, gram_targets, transform, device):
+    ds = ListImageDataset(content_paths, transform)
+    loader = DataLoader(ds, BATCH_SIZE, shuffle=True, num_workers=8, pin_memory=True)
+
     encoder = VGGEncoder().to(device).eval()
     decoder = Decoder().to(device)
-    optimizer = torch.optim.Adam(decoder.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=LR)
 
-    # c) Loss network layers for style loss
-    # we will extract features at relu1_1, relu2_1, relu3_1, relu4_1
-    style_layers = [0, 5, 10, 19, 21]  # indices in VGG features
+    for epoch in range(1, EPOCHS+1):
+        for batch in loader:
+            batch = batch.to(device)
 
-    for epoch in range(epochs):
-        for i, (content_batch, _) in enumerate(content_loader):
-            try:
-                style_batch, _ = next(style_iter)
-            except StopIteration:
-                style_iter = iter(style_loader)
-                style_batch, _ = next(style_iter)
+            # content features
+            with torch.no_grad():
+                f_c = encoder(batch)
 
-            content_batch = content_batch.to(device)
-            style_batch   = style_batch.to(device)
+            # decode from content features
+            x = decoder(f_c)
 
-            # forward
-            f_c = encoder(content_batch)
-            f_s = encoder(style_batch)
-            t   = adaptive_instance_norm(f_c, f_s)
-            x   = decoder(t)
-
-            # compute losses
-            # 1) content loss on relu4_1: Enc(x) vs t
+            # content loss
             f_x = encoder(x)
-            loss_c = F.mse_loss(f_x, t)
+            loss_c = F.mse_loss(f_x, f_c)
 
-            # 2) style loss: sum over layers
+            # style loss
             loss_s = 0.0
-            feats_x = [encoder.enc_layers[:l+1](x) for l in style_layers]
-            feats_s = [encoder.enc_layers[:l+1](style_batch) for l in style_layers]
-            for fx, fs in zip(feats_x, feats_s):
-                loss_s += F.mse_loss(gram_matrix(fx), gram_matrix(fs))
+            x_i = batch
+            for idx, layer in enumerate(encoder.enc_layers):
+                x_i = layer(x_i)
+                if idx in STYLE_LAYERS:
+                    Gx = gram_matrix(x_i)
+                    Gs = gram_targets[idx].expand_as(Gx)
+                    loss_s += F.mse_loss(Gx, Gs)
 
-            # 3) total variation loss
-            loss_tv = tv_weight * (
-                torch.sum(torch.abs(x[:,:,1:,:] - x[:,:,:-1,:])) +
-                torch.sum(torch.abs(x[:,:,:,1:] - x[:,:,:,:-1]))
+            # total variation
+            loss_tv = TV_WEIGHT * (
+                (x[:,:,1:,:]-x[:,:,:-1,:]).abs().sum() +
+                (x[:,:,:,1:]-x[:,:,:,:-1]).abs().sum()
             )
 
-            loss = content_weight * loss_c + style_weight * loss_s + loss_tv
-
+            loss = CONTENT_WEIGHT*loss_c + STYLE_WEIGHT*loss_s + loss_tv
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            if (i+1) % 200 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Batch [{i+1}/{len(content_loader)}] "
-                      f"Loss: {loss.item():.4f} (C {loss_c:.4f}, S {loss_s:.4f})")
-
-        # save checkpoint each epoch
-        torch.save(decoder.state_dict(), f"decoder_epoch{epoch+1}.pth")
+        print(f"Epoch {epoch}/{EPOCHS} → C {loss_c.item():.2f}  S {loss_s.item():.2f}")
+        torch.save(decoder.state_dict(), f"decoder_style_epoch{epoch}.pth")
 
     return decoder
 
-# -- 6) Inference ----------------------------------------------------
-def stylize(decoder, content_img_path, style_img_path, out_path,
-            img_size=512, device='cuda'):
-    tf = transforms.Compose([
-        transforms.Resize(img_size),
-        transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x * 255)
-    ])
-    loader = lambda p: tf(Image.open(p).convert('RGB')).unsqueeze(0).to(device)
-    c = loader(content_img_path)
-    s = loader(style_img_path)
-
-    encoder = VGGEncoder().to(device).eval()
-    decoder = decoder.to(device).eval()
-
+# -----------------------------------------------------------------------------
+# Stylize helper (feed-forward only needs content)
+# -----------------------------------------------------------------------------
+def stylize(decoder, content_img_path, out_path, transform, device):
+    decoder.eval()
+    img = Image.open(content_img_path).convert('RGB')
+    inp = transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        f_c = encoder(c)
-        f_s = encoder(s)
-        t   = adaptive_instance_norm(f_c, f_s)
-        out = decoder(t).clamp(0, 255) / 255.0
+        f_c = VGGEncoder().to(device).eval()(inp)
+        out = decoder(f_c).clamp(0,255) / 255.0
 
-    # save output
-    out_img = transforms.ToPILImage()(out.squeeze().cpu())
-    out_img.save(out_path)
-    print(f"Saved stylized image to {out_path}")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    Image.fromarray((out.squeeze().cpu().numpy().transpose(1,2,0)*255).astype('uint8'))\
+         .save(out_path)
 
-# -- 7) Example usage -----------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
 if __name__ == '__main__':
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # Train (you’ll want more epochs in practice—e.g. 4–6)
-    decoder = train_fast_style_transfer(
-        content_dir='../Datasets/COCO/train2017',
-        style_dir  ='../Datasets/WikiArt/wikiart/images',
-        batch_size = 8,
-        img_size   = 256,
-        epochs     = 4,
-        lr         = 1e-4,
-        device     = device
-    )
-    # Inference
-    stylize(decoder,
-            content_img_path='examples/content.jpg',
-            style_img_path  ='examples/style.jpg',
-            out_path        ='examples/output.jpg',
-            img_size=512,
-            device=device)
+    # content images
+    content_root = '../datasets/COCO/train2017'
+    content_paths = [
+        os.path.join(dp,fn)
+        for dp,_,fns in os.walk(content_root)
+        for fn in fns if fn.lower().endswith(('.jpg','png','jpeg'))
+    ]
+    random.shuffle(content_paths)
+    c_split = 900
+    train_content = content_paths[:c_split]
+    val_content   = content_paths[c_split:1000]
+
+    # style folder containing art-deco images
+    style_folder = '../datasets/WikiArt/art-deco'
+
+    # transform (no lambda inside DataLoader)
+    TRANSFORM = transforms.Compose([
+        transforms.Resize(IMG_SIZE),
+        transforms.CenterCrop(IMG_SIZE),
+        transforms.ToTensor(),
+        transforms.Lambda(mul255)
+    ])
+
+    print("Computing style targets…")
+    gram_targets = compute_style_targets(style_folder, TRANSFORM, DEVICE)
+
+    print("Training per-style network…")
+    decoder = train_per_style(train_content, gram_targets, TRANSFORM, DEVICE)
+
+    print("Evaluating content reconstruction loss…")
+    enc = VGGEncoder().to(DEVICE).eval()
+    tot = 0.0
+    for img_path in val_content:
+        img = TRANSFORM(Image.open(img_path).convert('RGB')).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            f_c = enc(img)
+            out = decoder(f_c)
+            tot += F.mse_loss(enc(out), f_c).item()
+    print(f"Val content loss: {tot/len(val_content):.2f}")
+
+    print("Stylizing examples…")
+    os.makedirs('outputs', exist_ok=True)
+    for i, img_path in enumerate(val_content[:5]):
+        out_file = f"outputs/example_{i}.jpg"
+        stylize(decoder, img_path, out_file, TRANSFORM, DEVICE)
+        print("Saved", out_file)
