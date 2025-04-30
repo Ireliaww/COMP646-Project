@@ -4,7 +4,7 @@ import os
 import csv
 
 # Root of your Datasets directory (must match your real folder name & casing)
-DATASETS_ROOT = '../Datasets/WikiArt'
+DATASETS_ROOT = '../Datasets/Wiki'
 # Ensure the directory exists
 os.makedirs(DATASETS_ROOT, exist_ok=True)
 
