@@ -41,11 +41,11 @@ def main():
 
     # Training setup
     trainer = CLIPFineTuner(device="cuda")
-    optimizer = optim.AdamW(trainer.model.parameters(), lr=5e-6)
+    optimizer = optim.AdamW(trainer.model.parameters(), lr=1e-5)
     logger = ExperimentLogger()
 
     # Training loop
-    num_epochs = 1
+    num_epochs = 10
     loss_history = []
 
     for epoch in range(num_epochs):
