@@ -1,39 +1,65 @@
-from typing import Dict, Tuple, Any, List
+import numpy as np
 import torch
 import clip
-from torch import nn
-
+from typing import List, Dict
 
 class CLIPMetrics:
-    """Metric calculation module for CLIP evaluation"""
-
-    def __init__(self, device="cuda", clip_model="ViT-B/32"):
+    def __init__(self, device: str = "cuda", clip_model: str = "ViT-B/32"):
+        """CLIP-based metric calculator for text-image alignment
+        Args:
+            device: Computation device (cuda/cpu)
+            clip_model: CLIP model variant
+        """
         self.device = device
         self.model, _ = clip.load(clip_model, device=device)
         self.model.eval()
-        self.null_image_features = None
-        self.null_text_features = None
+        self.model.requires_grad_(False)  # Freeze all parameters
 
-    def _precompute_null_features(self, batch_size: int):
-        """Precompute null features for CLIP score baseline"""
+    def compute_all_metrics(self,
+                            images: torch.Tensor,
+                            texts: List[str]) -> Dict[str, float]:
+        """Calculate key alignment metrics between images and texts
+
+        Args:
+            images: Preprocessed image tensor [N, C, H, W]
+            texts: Raw text descriptions (list of strings)
+
+        Returns:
+            Dictionary containing:
+            - clip_score: Average cosine similarity (0-1)
+            - top1_acc: Retrieval accuracy (%)
+        """
+        # Validate input dimensions
+        if images.dim() != 4:
+            raise ValueError(f"Images must be 4D tensor, got {images.dim()}D")
+
+        if len(texts) != images.size(0):
+            raise ValueError(f"Mismatched samples: {len(texts)} texts vs {images.size(0)} images")
+
+        # Tokenize texts and move to device
+        text_inputs = clip.tokenize(texts).to(self.device)
+
         with torch.no_grad():
-            null_text = clip.tokenize([""] * batch_size).to(self.device)
-            null_image = torch.zeros(batch_size, 3, 224, 224).to(self.device)
-            self.null_text_features = self.model.encode_text(null_text)
-            self.null_image_features = self.model.encode_image(null_image)
+            # Extract normalized features
+            image_features = self.model.encode_image(images.to(self.device))
+            text_features = self.model.encode_text(text_inputs)
 
-    def clip_score(self, images: torch.Tensor, texts: List[str]) -> Tuple[float, float]:
-        """Calculate directional CLIP scores"""
-        batch_size = images.size(0)
-        if self.null_image_features is None or self.null_text_features.size(0) != batch_size:
-            self._precompute_null_features(batch_size)
+            # L2 normalization
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        with torch.no_grad():
-            text_tokens = clip.tokenize(texts).to(self.device)
-            image_features = self.model.encode_image(images)
-            text_features = self.model.encode_text(text_tokens)
+            # Calculate similarity matrix
+            similarity = image_features @ text_features.T  # [N, N]
 
-        image_sim = (image_features - self.null_image_features) @ (text_features - self.null_text_features).T
-        text_sim = (text_features - self.null_text_features) @ (image_features - self.null_image_features).T
+            # CLIP score (diagonal elements)
+            clip_score = torch.diag(similarity).mean().item()
 
-        return image_sim.diag().mean().item(), text_sim.diag().mean().item()
+            # Top-1 accuracy
+            labels = torch.arange(len(texts), device=self.device)
+            predictions = similarity.argmax(dim=1)
+            top1_acc = (predictions == labels).float().mean().item() * 100
+
+        return {
+            "clip_score": clip_score,
+            "top1_acc": top1_acc
+        }
