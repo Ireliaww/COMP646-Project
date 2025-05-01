@@ -12,6 +12,7 @@ from torchvision import transforms
 import config
 from model import VGGEncoder, Decoder, adaptive_instance_norm
 from ip_adapter import IPAdapter
+from pathlib import Path
 
 # ─── 1) DEVICE ───────────────────────────────────────────────────────────────
 DEVICE = torch.device("mps")
@@ -27,14 +28,15 @@ INV_NORMALIZE = config.INV_NORMALIZE
 
 # ─── 3) BUILD & LOAD AN IP-ADAPTER ──────────────────────────────────────────────
 def load_adapter(style_name):
-    # 3.1 load encoder
+    MODEL_DIR = Path(__file__).parent.resolve()
+
     enc = VGGEncoder().to(DEVICE).eval()
-    # 3.2 load decoder weights for this style
     dec = Decoder().to(DEVICE)
-    ckpt = os.path.join(config.OUT_DIR, f"decoder_{style_name}.pth")
+
+    ckpt = MODEL_DIR / "checkpoints" / f"decoder_{style_name}.pth"
     dec.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     dec.eval()
-    # 3.3 wrap in adapter
+
     return IPAdapter(enc, dec)
 
 

@@ -7,6 +7,7 @@ from PIL import Image
 from torchvision import transforms
 from model import VGGEncoder, Decoder
 import config
+from pathlib import Path
 
 # ─── 1) DEVICE ───────────────────────────────────────────────────────────────
 DEVICE = torch.device("mps")
@@ -36,8 +37,9 @@ def load_encoder():
     return enc
 
 def load_decoder(style_name):
-    ckpt = os.path.join(config.OUT_DIR, f"decoder_{style_name}.pth")
-    dec  = Decoder().to(DEVICE)
+    MODEL_DIR = Path(__file__).parent.resolve()
+    ckpt = MODEL_DIR / "checkpoints" / f"decoder_{style_name}.pth"
+    dec = Decoder()
     dec.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     dec.eval()
     return dec
