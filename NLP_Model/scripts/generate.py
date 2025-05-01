@@ -26,6 +26,10 @@ def generate_style_reference(prompt):
 
 
 if __name__ == "__main__":
-    user_prompt = "A painting in the {x} style, professional artwork, trending on artstation"
-    style_image, style_embedding = generate_style_reference(user_prompt)
-    style_image.save("generated_style.png")
+    barock_prompt = "A painting in the Barock style, professional artwork, trending on artstation"
+    barock_image, _ = generate_style_reference(barock_prompt)
+    barock_image.save("barock_style.png")
+
+    expressionism_prompt = "A painting in the Abstrakter-Expressionismus style, professional artwork, trending on artstation"
+    expressionism_image, _ = generate_style_reference(expressionism_prompt)
+    expressionism_image.save("abstrakter_expressionismus_style.png")
