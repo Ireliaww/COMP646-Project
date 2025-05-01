@@ -1,77 +1,88 @@
+import glob
 import os
-import argparse
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
+os.environ['OMP_NUM_THREADS']    = '1'
 import torch
 from PIL import Image
 from torchvision import transforms
 from model import VGGEncoder, Decoder
-from torchvision.models import VGG19_Weights
+import config
 
+# ─── 1) DEVICE ───────────────────────────────────────────────────────────────
+DEVICE = torch.device("mps")
 
-def load_decoder(path, device):
-    """Load a trained Decoder checkpoint."""
-    dec = Decoder().to(device)
-    state = torch.load(path, map_location=device)
-    dec.load_state_dict(state)
+# ─── 2) IMAGENET STATS & TRANSFORMS ──────────────────────────────────────────
+# These must match exactly what you used during training.
+IMAGENET_MEAN = config.IMAGENET_MEAN
+IMAGENET_STD  = config.IMAGENET_STD
+IMG_SIZE      = config.IMG_SIZE
+
+PREPROCESS = transforms.Compose([
+    transforms.Resize(IMG_SIZE),
+    transforms.CenterCrop(IMG_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+INV_NORMALIZE = transforms.Normalize(
+    mean=[-m/s for m,s in zip(IMAGENET_MEAN, IMAGENET_STD)],
+    std=[ 1.0/s for   s in IMAGENET_STD]
+)
+
+# ─── 3) MODEL LOADERS ────────────────────────────────────────────────────────
+def load_encoder():
+    enc = VGGEncoder().to(DEVICE)
+    enc.eval()
+    return enc
+
+def load_decoder(style_name):
+    ckpt = os.path.join(config.OUT_DIR, f"decoder_{style_name}.pth")
+    dec  = Decoder().to(DEVICE)
+    dec.load_state_dict(torch.load(ckpt, map_location=DEVICE))
     dec.eval()
     return dec
 
-# official ImageNet preprocess (matches model training)
-PREPROCESS = VGG19_Weights.IMAGENET1K_V1.transforms()
-# inverse normalize to [0..1]
-IMAGENET_MEAN = VGG19_Weights.IMAGENET1K_V1.meta['mean'] if 'meta' in dir(VGG19_Weights.IMAGENET1K_V1) \
-                else VGG19_Weights.IMAGENET1K_V1.transforms()._tfms[2].mean
-IMAGENET_STD  = VGG19_Weights.IMAGENET1K_V1.meta['std']  if 'meta' in dir(VGG19_Weights.IMAGENET1K_V1) \
-                else VGG19_Weights.IMAGENET1K_V1.transforms()._tfms[2].std
-INV_NORMALIZE = transforms.Normalize(
-    mean=[-m/s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)],
-    std=[1/s for s in IMAGENET_STD]
-)
-
-
-def stylize(decoder, content_path, output_path, device):
-    """Stylize a single content image and save side-by-side with original."""
-    # load & preprocess
-    img = Image.open(content_path).convert('RGB')
-    inp = PREPROCESS(img).unsqueeze(0).to(device)
-
-    # encode + decode
-    encoder = VGGEncoder().to(device).eval()
+# ─── 4) STYLIZE ONE IMAGE ────────────────────────────────────────────────────
+def stylize_image(decoder, encoder, img: Image.Image) -> Image.Image:
+    """Returns a PIL image of the stylized result."""
+    inp = PREPROCESS(img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        f_c = encoder(inp)
-        raw = decoder(f_c)
-        out = INV_NORMALIZE(raw.squeeze(0))
-        out = torch.clamp(out, 0, 1)
+        feats = encoder(inp)
+        raw   = decoder(feats).squeeze(0)      # still normalized
+        out   = INV_NORMALIZE(raw)             # undo normalization
+        out   = torch.clamp(out, 0, 1)
+    arr = (out.cpu().numpy().transpose(1,2,0) * 255).astype("uint8")
+    return Image.fromarray(arr)
 
-    # convert to PIL
-    stylized = Image.fromarray((out.cpu().numpy().transpose(1,2,0)*255).astype('uint8'))
-    base = os.path.basename(content_path)
-    # ensure output
-    os.makedirs(output_path, exist_ok=True)
-    orig_out = os.path.join(output_path, f"orig_{base}")
-    styl_out = os.path.join(output_path, f"styl_{base}")
-    img.save(orig_out)
-    stylized.save(styl_out)
-    print(f"Saved: {orig_out}, {styl_out}")
+# ─── 5) MAIN ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    # load encoder just once
+    encoder = load_encoder()
 
+    # gather and sort all content images, then take the first 5
+    all_imgs = sorted(glob.glob(os.path.join(config.CONTENT_DIR, "*")))
+    all_imgs = [p for p in all_imgs
+                if p.lower().endswith((".jpg","jpeg","png"))]
+    first5 = all_imgs[:5]
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Generate stylized images using a trained Decoder.")
-    parser.add_argument('--model',    type=str, required=True, help='Path to the .pth decoder checkpoint')
-    parser.add_argument('--content',  type=str, required=True, help='Path to a content image or folder')
-    parser.add_argument('--out_dir',  type=str, default='outputs', help='Directory to save results')
-    args = parser.parse_args()
+    # for each style, load its decoder and run through the 5 images
+    for style in config.STYLES:
+        print(f"\n→ Generating style: {style!r}")
+        decoder = load_decoder(style)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    decoder = load_decoder(args.model, device)
+        out_dir = os.path.join(config.GENERATE_OUT_DIR, style)
+        os.makedirs(out_dir, exist_ok=True)
 
-    # if content is a folder, process all images inside
-    paths = []
-    if os.path.isdir(args.content):
-        for fn in os.listdir(args.content):
-            if fn.lower().endswith(('.jpg','jpeg','png')):
-                paths.append(os.path.join(args.content, fn))
-    else:
-        paths = [args.content]
+        for path in first5:
+            base = os.path.basename(path)
+            orig = Image.open(path).convert("RGB")
+            styl = stylize_image(decoder, encoder, orig)
 
-    for p in paths:
-        stylize(decoder, p, args.out_dir, device)
+            # save side-by-side files
+            orig_out = os.path.join(out_dir,  f"orig_{base}")
+            styl_out = os.path.join(out_dir, f"styl_{style}_{base}")
+
+            orig .save(orig_out)
+            styl .save(styl_out)
+            print(f"  • Saved {orig_out}")
+            print(f"    Saved {styl_out}")
