@@ -19,7 +19,7 @@ import config
 from model import VGGEncoder, Decoder, gram_matrix
 
 # ─── Device ────────────────────────────────────────────────────────────────
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("mps")
 
 # ─── Preprocessing ─────────────────────────────────────────────────────────
 PREPROCESS = VGG19_Weights.IMAGENET1K_V1.transforms()
